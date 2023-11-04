@@ -1,3 +1,5 @@
+use anyhow::anyhow;
+use anyhow::Context;
 use anyhow::Result;
 use flate2::bufread::ZlibDecoder;
 use std::fs;
@@ -47,10 +49,12 @@ fn git_init() -> Result<()> {
 }
 
 fn git_cat_file(blob_sha: &str) -> Result<()> {
+    // https://wyag.thb.lt/#objects
+
     let path = PathBuf::from(format!(
-        ".git/objects/{}/{}",
-        &blob_sha[..2],
-        &blob_sha[2..]
+        ".git/objects/{}/{}", // Objects are stored in .git/objects
+        &blob_sha[..2], // They are in a folder named after the first two characters of the hash
+        &blob_sha[2..]  // The remaining characters are used for the file name
     ));
 
     let f = File::open(path)?;
@@ -60,7 +64,17 @@ fn git_cat_file(blob_sha: &str) -> Result<()> {
     let mut s = String::new();
     z.read_to_string(&mut s)?;
 
-    print!("{s}");
+    // The object should start with a header made up of:
+    // - the object type
+    // - an ASCII space
+    // - the size in bytes
+    // - a null byte (b"\x00" or '\0')
+    let (_header, contents) = s
+        .split_once('\0')
+        .ok_or(anyhow!("No null byte found"))
+        .context("Strip header")?;
+
+    print!("{contents}");
 
     Ok(())
 }
