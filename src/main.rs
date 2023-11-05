@@ -1,16 +1,11 @@
-use anyhow::anyhow;
-use anyhow::Context;
-use anyhow::Result;
-use flate2::bufread::ZlibDecoder;
-// use std::env;
-use std::fs;
-use std::fs::File;
-use std::io::prelude::*;
-use std::io::BufReader;
-use std::path::PathBuf;
+use anyhow::{anyhow, Context, Result};
+use flate2::{bufread::ZlibDecoder, write::ZlibEncoder, Compression};
+use sha1::{Digest, Sha1};
+use std::fs::{self, File};
+use std::io::{prelude::*, BufReader};
+use std::path::{Path, PathBuf};
 
-use clap::Parser;
-use clap::Subcommand;
+use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -26,6 +21,10 @@ enum Command {
         #[arg(short = 'p')]
         blob_sha: Option<String>,
     },
+    HashObject {
+        #[arg(short = 'w')]
+        file: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -35,6 +34,10 @@ fn main() -> Result<()> {
         Command::Init => git_init(),
         Command::CatFile { blob_sha } => match blob_sha {
             Some(blob_sha) => git_cat_file(blob_sha),
+            None => Ok(()),
+        },
+        Command::HashObject { file } => match file {
+            Some(file) => git_hash_object(file),
             None => Ok(()),
         },
     }
@@ -84,6 +87,48 @@ fn _git_cat_file<W: Write>(blob_sha: &str, writer: &mut W) -> Result<()> {
     Ok(())
 }
 
+fn git_hash_object(path: &Path) -> Result<()> {
+    _git_hash_object(path, &mut std::io::stdout())
+}
+
+fn _git_hash_object<W: Write>(path: &Path, writer: &mut W) -> Result<()> {
+    // Read file
+    let f = File::open(path)?;
+    let mut reader = BufReader::new(f);
+    let mut file_contents = Vec::new();
+    let bytes = reader.read_to_end(&mut file_contents)?;
+
+    // Add header to create a blob
+    let blob = [format!("blob {}\x00", bytes).as_bytes(), &file_contents].concat();
+
+    // Create hasher, compute sha1 hash and print it to stdout
+    let mut hasher = Sha1::new();
+    hasher.update(&blob);
+    let hash = hex::encode(hasher.finalize());
+    writer.write_all(hash.as_bytes())?;
+    // println!("{hash}");
+
+    // Split hash to get dir name and file name (see `git_cat_file`)
+    let (dir_name, file_name) = hash.split_at(2);
+    // Create dir if necessary
+    if !PathBuf::from(dir_name).exists() {
+        fs::create_dir(dir_name).context("Create directory in .git/objects")?;
+    }
+    let path = format!("{}/{}", dir_name, file_name);
+    // Create file
+    let mut file = File::create(path)?;
+
+    // Create encoder and compress blob
+    let mut e = ZlibEncoder::new(Vec::new(), Compression::default());
+    e.write_all(&blob)?;
+    let compressed = e.finish()?;
+
+    // Write blob to file
+    file.write_all(&compressed)?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::{env::set_current_dir, io::Cursor, path::Path, process::Command};
@@ -92,7 +137,9 @@ mod tests {
 
     use super::*;
 
-    fn create_git_repo(path: &Path) -> Result<()> {
+    const EMPTY_FILE_HASH: &str = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+
+    fn create_empty_git_repo(path: &Path) -> Result<()> {
         let output = Command::new("git")
             .arg("init")
             .current_dir(path)
@@ -101,6 +148,12 @@ mod tests {
         if !output.status.success() {
             return Err(anyhow!("Did not initialize git repo successfully"));
         }
+
+        Ok(())
+    }
+
+    fn create_git_repo(path: &Path) -> Result<()> {
+        create_empty_git_repo(path)?;
 
         let output = Command::new("git")
             .args(["commit", "--allow-empty", "-m", "'Empty commit'"])
@@ -173,6 +226,35 @@ mod tests {
         assert!(lines
             .next()
             .is_some_and(|line| line.is_ok_and(|line| !line.is_empty())));
+
+        dir.close()?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn hash_object() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path();
+        create_empty_git_repo(path)?;
+        set_current_dir(path).context("cd into temporary directory")?;
+
+        let output = Command::new("touch")
+            .arg("main.rs")
+            .output()
+            .context("Create empty file")?;
+        if !output.status.success() {
+            return Err(anyhow!("Could not create empty file"));
+        }
+
+        let mut buff = Cursor::new(Vec::new());
+        _git_hash_object(&PathBuf::from("main.rs"), &mut buff)?;
+
+        buff.set_position(0);
+        let mut lines = buff.lines();
+        assert!(lines
+            .next()
+            .is_some_and(|line| line.is_ok_and(|line| line.trim() == EMPTY_FILE_HASH)));
 
         dir.close()?;
 
