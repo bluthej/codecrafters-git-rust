@@ -106,15 +106,15 @@ fn _git_hash_object<W: Write>(path: &Path, writer: &mut W) -> Result<()> {
     hasher.update(&blob);
     let hash = hex::encode(hasher.finalize());
     writer.write_all(hash.as_bytes())?;
-    // println!("{hash}");
 
     // Split hash to get dir name and file name (see `git_cat_file`)
     let (dir_name, file_name) = hash.split_at(2);
     // Create dir if necessary
-    if !PathBuf::from(dir_name).exists() {
-        fs::create_dir(dir_name).context("Create directory in .git/objects")?;
+    let dir_path = format!(".git/objects/{}", dir_name);
+    if !PathBuf::from(&dir_path).exists() {
+        fs::create_dir(&dir_path).context("Create directory in .git/objects")?;
     }
-    let path = format!("{}/{}", dir_name, file_name);
+    let path = format!("{}/{}", dir_path, file_name);
     // Create file
     let mut file = File::create(path)?;
 
@@ -255,6 +255,13 @@ mod tests {
         assert!(lines
             .next()
             .is_some_and(|line| line.is_ok_and(|line| line.trim() == EMPTY_FILE_HASH)));
+
+        assert!(PathBuf::from(format!(
+            ".git/objects/{}/{}",
+            &EMPTY_FILE_HASH[..2],
+            &EMPTY_FILE_HASH[2..]
+        ))
+        .exists());
 
         dir.close()?;
 
