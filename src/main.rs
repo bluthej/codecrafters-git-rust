@@ -25,6 +25,11 @@ enum Command {
         #[arg(short = 'w')]
         file: Option<PathBuf>,
     },
+    LsTree {
+        #[arg(long)]
+        name_only: bool,
+        tree_sha: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -38,6 +43,13 @@ fn main() -> Result<()> {
         },
         Command::HashObject { file } => match file {
             Some(file) => git_hash_object(file),
+            None => Ok(()),
+        },
+        Command::LsTree {
+            name_only: _,
+            tree_sha,
+        } => match tree_sha {
+            Some(tree_sha) => git_ls_tree(tree_sha),
             None => Ok(()),
         },
     }
@@ -126,6 +138,10 @@ fn _git_hash_object<W: Write>(path: &Path, writer: &mut W) -> Result<()> {
     // Write blob to file
     file.write_all(&compressed)?;
 
+    Ok(())
+}
+
+fn git_ls_tree(_tree_sha: &str) -> Result<()> {
     Ok(())
 }
 
