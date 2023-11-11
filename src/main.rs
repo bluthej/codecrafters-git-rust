@@ -1,9 +1,13 @@
 use anyhow::{anyhow, Context, Result};
 use flate2::{bufread::ZlibDecoder, write::ZlibEncoder, Compression};
 use sha1::{Digest, Sha1};
+use std::error::Error;
+use std::fmt::Display;
 use std::fs::{self, File};
 use std::io::{prelude::*, BufReader};
+use std::num::ParseIntError;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use clap::{Parser, Subcommand};
 
@@ -71,10 +75,18 @@ fn git_cat_file(blob_sha: &str) -> Result<()> {
 
 // Implementation based on information in https://wyag.thb.lt/#objects
 fn _git_cat_file<W: Write>(blob_sha: &str, writer: &mut W) -> Result<()> {
+    let object: GitObject = read_object(blob_sha)?.parse()?;
+
+    writer.write_all(object.contents.as_bytes())?;
+
+    Ok(())
+}
+
+fn read_object(sha: &str) -> Result<String> {
     let path = PathBuf::from(format!(
         ".git/objects/{}/{}", // Objects are stored in .git/objects
-        &blob_sha[..2], // They are in a folder named after the first two characters of the hash
-        &blob_sha[2..]  // The remaining characters are used for the file name
+        &sha[..2], // They are in a folder named after the first two characters of the hash
+        &sha[2..]  // The remaining characters are used for the file name
     ));
 
     let f = File::open(path)?;
@@ -84,19 +96,99 @@ fn _git_cat_file<W: Write>(blob_sha: &str, writer: &mut W) -> Result<()> {
     let mut s = String::new();
     z.read_to_string(&mut s)?;
 
-    // The object should start with a header made up of:
-    // - the object type
+    Ok(s)
+}
+
+#[allow(dead_code)]
+struct GitObject {
+    obj_type: GitObjectType,
+    size: usize,
+    contents: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ParseGitObjectError {
+    MissingSpace,
+    Type(ParseGitObjectTypeError),
+    MissingNullByte,
+    IncorrectSize(ParseIntError),
+}
+
+impl Display for ParseGitObjectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingSpace => write!(f, "No space found between the object type and the size."),
+            Self::Type(_) => write!(f, "Unable to parse the object type."),
+            Self::MissingNullByte => {
+                write!(f, "No null byte found between the size and the contents.")
+            }
+            Self::IncorrectSize(e) => write!(f, "Unable to parse the size: {e}"),
+        }
+    }
+}
+
+impl Error for ParseGitObjectError {}
+
+impl From<ParseGitObjectTypeError> for ParseGitObjectError {
+    fn from(_value: ParseGitObjectTypeError) -> Self {
+        ParseGitObjectError::Type(ParseGitObjectTypeError)
+    }
+}
+
+impl FromStr for GitObject {
+    type Err = ParseGitObjectError;
+
+    // A git object is made up of:
+    // - the object type (blob, commit, tag or tree)
     // - an ASCII space
-    // - the size in bytes
+    // - the size of the contents in bytes
     // - a null byte (b"\x00" or '\0')
-    let (_header, contents) = s
-        .split_once('\0')
-        .ok_or(anyhow!("No null byte found"))
-        .context("Strip header")?;
+    // - the contents
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let Some((obj_type, rest)) = s.split_once(' ') else {
+            return Err(ParseGitObjectError::MissingSpace);
+        };
 
-    writer.write_all(contents.as_bytes())?;
+        let obj_type = GitObjectType::from_str(obj_type).map_err(ParseGitObjectTypeError::from)?;
 
-    Ok(())
+        let Some((size, contents)) = rest.split_once('\0') else {
+            return Err(ParseGitObjectError::MissingNullByte);
+        };
+
+        let size = size.parse().map_err(ParseGitObjectError::IncorrectSize)?;
+
+        let contents = contents.to_string();
+
+        Ok(Self {
+            obj_type,
+            size,
+            contents,
+        })
+    }
+}
+
+enum GitObjectType {
+    Blob,
+    Commit,
+    Tag,
+    Tree,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ParseGitObjectTypeError;
+
+impl FromStr for GitObjectType {
+    type Err = ParseGitObjectTypeError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "blob" => Ok(Self::Blob),
+            "commit" => Ok(Self::Commit),
+            "tag" => Ok(Self::Tag),
+            "tree" => Ok(Self::Tree),
+            _ => Err(ParseGitObjectTypeError),
+        }
+    }
 }
 
 fn git_hash_object(path: &Path) -> Result<()> {
