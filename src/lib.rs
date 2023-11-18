@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 mod git_object;
 
-use git_object::GitObject;
+use git_object::{GitObject, GitObjectType};
 
 pub fn git_init() -> Result<()> {
     fs::create_dir(".git").context("Create .git directory")?;
@@ -26,14 +26,15 @@ pub fn git_cat_file(blob_sha: &str) -> Result<()> {
 
 // Implementation based on information in https://wyag.thb.lt/#objects
 fn _git_cat_file<W: Write>(blob_sha: &str, writer: &mut W) -> Result<()> {
-    let object: GitObject = read_object(blob_sha)?.parse()?;
+    let object_bytes = read_object(blob_sha)?;
+    let object = GitObject::from_bytes(&object_bytes)?;
 
     writer.write_all(object.contents.as_bytes())?;
 
     Ok(())
 }
 
-fn read_object(sha: &str) -> Result<String> {
+fn read_object(sha: &str) -> Result<Vec<u8>> {
     let path = PathBuf::from(format!(
         ".git/objects/{}/{}", // Objects are stored in .git/objects
         &sha[..2], // They are in a folder named after the first two characters of the hash
@@ -44,10 +45,10 @@ fn read_object(sha: &str) -> Result<String> {
     let reader = BufReader::new(f);
 
     let mut z = ZlibDecoder::new(reader);
-    let mut s = String::new();
-    z.read_to_string(&mut s)?;
+    let mut buffer = Vec::new();
+    z.read_to_end(&mut buffer)?;
 
-    Ok(s)
+    Ok(buffer)
 }
 
 pub fn git_hash_object(path: &Path) -> Result<()> {
@@ -92,7 +93,17 @@ fn _git_hash_object<W: Write>(path: &Path, writer: &mut W) -> Result<()> {
     Ok(())
 }
 
-pub fn git_ls_tree(_tree_sha: &str) -> Result<()> {
+// TODO: add test
+pub fn git_ls_tree(tree_sha: &str) -> Result<()> {
+    let object_bytes = read_object(tree_sha)?;
+    let object = GitObject::from_bytes(&object_bytes)?;
+
+    if object.obj_type != GitObjectType::Tree {
+        return Err(anyhow!("Expected `tree` object, got: {}", object.obj_type));
+    }
+
+    println!("{}", object.contents);
+
     Ok(())
 }
 
