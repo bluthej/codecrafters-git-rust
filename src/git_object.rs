@@ -34,14 +34,11 @@ impl GitObject {
     // - a null byte (b"\x00" or '\0')
     // - the contents
     pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let space_idx = bytes
-            .iter()
-            .position(|&b| b == b' ')
-            .ok_or(anyhow!("Could not find an ASCII space"))?;
+        let Some((obj_type, size, rest)) = parse_fields(bytes).context("parse fields")? else {
+            return Err(anyhow!("No bytes to parse"));
+        };
 
-        let obj_type = match str::from_utf8(&bytes[..space_idx])
-            .context("convert bytes of type field to UTF8")?
-        {
+        let obj_type = match obj_type {
             "blob" => GitObjectType::Blob,
             "commit" => GitObjectType::Commit,
             "tag" => GitObjectType::Tag,
@@ -54,20 +51,12 @@ impl GitObject {
             }
         };
 
-        let null_byte_idx = bytes[space_idx + 1..]
-            .iter()
-            .position(|&b| b == b'\0')
-            .ok_or(anyhow!("Could not find a null byte"))?;
-
-        let size: usize = str::from_utf8(&bytes[space_idx + 1..][..null_byte_idx])
-            .context("convert bytes of size field to UTF8")?
-            .parse()
-            .context("parse size")?;
+        let size: usize = size.parse().context("parse size")?;
 
         let contents = match obj_type {
             GitObjectType::Tree => {
                 let mut entries = Vec::new();
-                let mut bytes = &bytes[space_idx + null_byte_idx + 2..];
+                let mut bytes = rest;
                 while let Some((entry, rest)) =
                     parse_tree_entry(bytes).context("parse tree entry")?
                 {
@@ -76,7 +65,7 @@ impl GitObject {
                 }
                 entries.join("\n")
             }
-            _ => str::from_utf8(&bytes[space_idx + null_byte_idx + 2..])
+            _ => str::from_utf8(rest)
                 .context("convert bytes of contents field to UTF8")?
                 .to_string(),
         };
@@ -95,9 +84,23 @@ impl GitObject {
 // - the file/folder name
 // - a null byte (b"\x00" or '\0')
 // - the sha1 hash
-//
-// TODO: consolidate logic with parsing a GitObject
 fn parse_tree_entry(bytes: &[u8]) -> Result<Option<(TreeEntry, &[u8])>> {
+    let Some((mode, name, rest)) = parse_fields(bytes).context("parse fields")? else {
+        return Ok(None);
+    };
+
+    let mode: usize = mode.parse().context("parse mode")?;
+
+    let name = name.to_string();
+
+    let sha1 = hex::encode(&rest[..20]);
+
+    Ok(Some((TreeEntry { mode, name, sha1 }, &rest[20..])))
+}
+
+// There is a recurring logic of fields to parse:
+// [field] [field]\x00[rest]
+fn parse_fields(bytes: &[u8]) -> Result<Option<(&str, &str, &[u8])>> {
     if bytes.is_empty() {
         return Ok(None);
     }
@@ -108,24 +111,17 @@ fn parse_tree_entry(bytes: &[u8]) -> Result<Option<(TreeEntry, &[u8])>> {
         .iter()
         .position(|&b| b == b' ')
         .ok_or(anyhow!("Could not find an ASCII space"))?;
-    let mode = str::from_utf8(&bytes[..space_idx])
-        .context("convert mode field to UTF8")?
-        .parse::<usize>()
-        .context("parse mode")?;
+    let field1 = str::from_utf8(&bytes[..space_idx]).context("convert mode field to UTF8")?;
     bytes = &bytes[space_idx + 1..];
 
     let null_byte_idx = bytes
         .iter()
         .position(|&b| b == b'\0')
         .ok_or(anyhow!("Could not find a null byte"))?;
-    let name = str::from_utf8(&bytes[..null_byte_idx])
-        .context("convert name field to UTF8")?
-        .to_string();
+    let field2 = str::from_utf8(&bytes[..null_byte_idx]).context("convert name field to UTF8")?;
     bytes = &bytes[null_byte_idx + 1..];
 
-    let sha1 = hex::encode(&bytes[..20]);
-
-    Ok(Some((TreeEntry { mode, name, sha1 }, &bytes[20..])))
+    Ok(Some((field1, field2, bytes)))
 }
 
 impl Display for GitObjectType {
