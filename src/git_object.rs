@@ -1,8 +1,6 @@
-use std::error::Error;
+use anyhow::{anyhow, Context, Ok, Result};
 use std::fmt::Display;
-use std::num::ParseIntError;
 use std::str;
-use std::str::FromStr;
 
 #[allow(dead_code)]
 pub(crate) struct GitObject {
@@ -28,7 +26,6 @@ struct TreeEntry {
     sha1: String,
 }
 
-// TODO: improve error handling
 impl GitObject {
     // A git object is made up of:
     // - the object type (blob, commit, tag or tree)
@@ -36,42 +33,51 @@ impl GitObject {
     // - the size of the contents in bytes
     // - a null byte (b"\x00" or '\0')
     // - the contents
-    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, ParseGitObjectError> {
-        let Some(space_idx) = bytes.iter().position(|&b| b == b' ') else {
-            return Err(ParseGitObjectError::MissingSpace);
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let space_idx = bytes
+            .iter()
+            .position(|&b| b == b' ')
+            .ok_or(anyhow!("Could not find an ASCII space"))?;
+
+        let obj_type = match str::from_utf8(&bytes[..space_idx])
+            .context("convert bytes of type field to UTF8")?
+        {
+            "blob" => GitObjectType::Blob,
+            "commit" => GitObjectType::Commit,
+            "tag" => GitObjectType::Tag,
+            "tree" => GitObjectType::Tree,
+            s => {
+                return Err(anyhow!(
+                    "object type should be either blob, commit, tag or tree, got: {}",
+                    s
+                ))
+            }
         };
 
-        let obj_type: GitObjectType = str::from_utf8(&bytes[..space_idx])
-            .map_err(|e| {
-                eprintln!("Error parsing the object type: {e}");
-                ParseGitObjectError::Type(ParseGitObjectTypeError)
-            })?
-            .parse()?;
-
-        let Some(null_byte_idx) = bytes[space_idx + 1..].iter().position(|&b| b == b'\0') else {
-            return Err(ParseGitObjectError::MissingNullByte);
-        };
+        let null_byte_idx = bytes[space_idx + 1..]
+            .iter()
+            .position(|&b| b == b'\0')
+            .ok_or(anyhow!("Could not find a null byte"))?;
 
         let size: usize = str::from_utf8(&bytes[space_idx + 1..][..null_byte_idx])
-            .map_err(|e| {
-                eprintln!("Error parsing the content size: {e}");
-                ParseGitObjectError::MissingSpace
-            })?
+            .context("convert bytes of size field to UTF8")?
             .parse()
-            .map_err(ParseGitObjectError::IncorrectSize)?;
+            .context("parse size")?;
 
         let contents = match obj_type {
             GitObjectType::Tree => {
                 let mut entries = Vec::new();
                 let mut bytes = &bytes[space_idx + null_byte_idx + 2..];
-                while let Some((entry, rest)) = parse_tree_entry(bytes) {
+                while let Some((entry, rest)) =
+                    parse_tree_entry(bytes).context("parse tree entry")?
+                {
                     entries.push(entry.name);
                     bytes = rest;
                 }
                 entries.join("\n")
             }
             _ => str::from_utf8(&bytes[space_idx + null_byte_idx + 2..])
-                .map_err(|_| ParseGitObjectError::MissingSpace)?
+                .context("convert bytes of contents field to UTF8")?
                 .to_string(),
         };
 
@@ -90,32 +96,36 @@ impl GitObject {
 // - a null byte (b"\x00" or '\0')
 // - the sha1 hash
 //
-// TODO: improve error handling + consolidate logic with parsing a GitObject
-fn parse_tree_entry(bytes: &[u8]) -> Option<(TreeEntry, &[u8])> {
+// TODO: consolidate logic with parsing a GitObject
+fn parse_tree_entry(bytes: &[u8]) -> Result<Option<(TreeEntry, &[u8])>> {
     if bytes.is_empty() {
-        return None;
+        return Ok(None);
     }
 
-    let space_idx = bytes.iter().position(|&b| b == b' ').unwrap();
-    let mode = str::from_utf8(&bytes[..space_idx])
-        .unwrap()
-        .parse::<usize>()
-        .unwrap();
+    let mut bytes = bytes;
 
-    let null_byte_idx = bytes[space_idx + 1..]
+    let space_idx = bytes
+        .iter()
+        .position(|&b| b == b' ')
+        .ok_or(anyhow!("Could not find an ASCII space"))?;
+    let mode = str::from_utf8(&bytes[..space_idx])
+        .context("convert mode field to UTF8")?
+        .parse::<usize>()
+        .context("parse mode")?;
+    bytes = &bytes[space_idx + 1..];
+
+    let null_byte_idx = bytes
         .iter()
         .position(|&b| b == b'\0')
-        .unwrap();
-    let name = str::from_utf8(&bytes[space_idx + 1..][..null_byte_idx])
-        .unwrap()
+        .ok_or(anyhow!("Could not find a null byte"))?;
+    let name = str::from_utf8(&bytes[..null_byte_idx])
+        .context("convert name field to UTF8")?
         .to_string();
+    bytes = &bytes[null_byte_idx + 1..];
 
-    let sha1 = hex::encode(&bytes[space_idx + null_byte_idx + 2..]);
+    let sha1 = hex::encode(&bytes[..20]);
 
-    Some((
-        TreeEntry { mode, name, sha1 },
-        &bytes[space_idx + null_byte_idx + 22..],
-    ))
+    Ok(Some((TreeEntry { mode, name, sha1 }, &bytes[20..])))
 }
 
 impl Display for GitObjectType {
@@ -130,56 +140,5 @@ impl Display for GitObjectType {
                 Self::Tree => "tree",
             }
         )
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum ParseGitObjectError {
-    MissingSpace,
-    Type(ParseGitObjectTypeError),
-    MissingNullByte,
-    IncorrectSize(ParseIntError),
-}
-
-impl Display for ParseGitObjectError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::MissingSpace => {
-                write!(f, "No space found between the object type and the size.")
-            }
-            Self::Type(_) => write!(f, "Unable to parse the object type."),
-            Self::MissingNullByte => {
-                write!(f, "No null byte found between the size and the contents.")
-            }
-            Self::IncorrectSize(e) => write!(f, "Unable to parse the size: {e}"),
-        }
-    }
-}
-
-impl Error for ParseGitObjectError {}
-
-impl From<ParseGitObjectTypeError> for ParseGitObjectError {
-    fn from(_value: ParseGitObjectTypeError) -> Self {
-        ParseGitObjectError::Type(ParseGitObjectTypeError)
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct ParseGitObjectTypeError;
-
-impl FromStr for GitObjectType {
-    type Err = ParseGitObjectTypeError;
-
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s {
-            "blob" => Ok(Self::Blob),
-            "commit" => Ok(Self::Commit),
-            "tag" => Ok(Self::Tag),
-            "tree" => Ok(Self::Tree),
-            _ => {
-                eprintln!("Unexpected type, got: {}", s);
-                Err(ParseGitObjectTypeError)
-            }
-        }
     }
 }
