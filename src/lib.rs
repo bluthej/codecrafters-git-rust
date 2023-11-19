@@ -93,23 +93,32 @@ fn _git_hash_object<W: Write>(path: &Path, writer: &mut W) -> Result<()> {
     Ok(())
 }
 
-// TODO: add test
 pub fn git_ls_tree(tree_sha: &str) -> Result<()> {
-    let object_bytes = read_object(tree_sha)?;
-    let object = GitObject::from_bytes(&object_bytes)?;
+    _git_ls_tree(tree_sha, &mut std::io::stdout())
+}
+
+fn _git_ls_tree<W: Write>(tree_sha: &str, writer: &mut W) -> Result<()> {
+    let object_bytes = read_object(tree_sha).context("read object")?;
+    let object = GitObject::from_bytes(&object_bytes).context("parse git object")?;
 
     if object.obj_type != GitObjectType::Tree {
         return Err(anyhow!("Expected `tree` object, got: {}", object.obj_type));
     }
 
-    println!("{}", object.contents);
+    writer.write_all(object.contents.as_bytes())?;
 
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{env::set_current_dir, io::Cursor, path::Path, process::Command};
+    use std::{
+        env::set_current_dir,
+        fs::{self, File},
+        io::Cursor,
+        path::Path,
+        process::Command,
+    };
 
     use anyhow::Ok;
 
@@ -137,7 +146,7 @@ mod tests {
             .args(["commit", "--allow-empty", "-m", "'Empty commit'"])
             .current_dir(path)
             .output()
-            .context("Initialize git repo")?;
+            .context("Make empty commit")?;
         if !output.status.success() {
             return Err(anyhow!("Commit was not successful"));
         }
@@ -145,11 +154,39 @@ mod tests {
         Ok(())
     }
 
-    fn get_head_sha() -> Result<String> {
+    fn create_git_repo_with_files(path: &Path) -> Result<()> {
+        create_empty_git_repo(path)?;
+
+        fs::create_dir(path.join("src"))?;
+        let _ = File::create(path.join("src").join("main.rs"))?;
+        let _ = File::create(path.join("Cargo.toml"))?;
+
         let output = Command::new("git")
-            .args(["rev-parse", "HEAD"])
+            .args(["add", "."])
+            .current_dir(path)
             .output()
-            .context("Get hash of HEAD")?;
+            .context("Stage new files")?;
+        if !output.status.success() {
+            return Err(anyhow!("Staging was not successful"));
+        }
+
+        let output = Command::new("git")
+            .args(["commit", "-m", "'Add files'"])
+            .current_dir(path)
+            .output()
+            .context("Commit changes")?;
+        if !output.status.success() {
+            return Err(anyhow!("Commit was not successful"));
+        }
+
+        Ok(())
+    }
+
+    fn get_sha(path: &str) -> Result<String> {
+        let output = Command::new("git")
+            .args(["rev-parse", path])
+            .output()
+            .context(format!("Get hash of {}", path))?;
         if !output.status.success() {
             return Err(anyhow!("Did not get last hash successfully"));
         }
@@ -176,13 +213,14 @@ mod tests {
         Ok(())
     }
 
+    // TODO: figure out why this test fails sometimes
     #[test]
     fn cat_file() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path();
         create_git_repo(path)?;
         set_current_dir(path).context("cd into temporary directory")?;
-        let hash = get_head_sha()?;
+        let hash = get_sha("HEAD")?;
 
         let mut buff = Cursor::new(Vec::new());
         _git_cat_file(&hash, &mut buff)?;
@@ -240,6 +278,34 @@ mod tests {
             &EMPTY_FILE_HASH[2..]
         ))
         .exists());
+
+        dir.close()?;
+
+        Ok(())
+    }
+
+    // TODO: figure out why this test fails sometimes
+    #[test]
+    fn ls_tree() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path();
+        create_git_repo_with_files(path).context("create git repo with files")?;
+        set_current_dir(path).context("cd into temporary directory")?;
+        // HEAD is a commit so I have to pass a path in addition to get a tree object
+        let hash = get_sha("HEAD:./")?;
+
+        let mut buff = Cursor::new(Vec::new());
+        _git_ls_tree(&hash, &mut buff).context("call ls-tree command with hash of root")?;
+
+        buff.set_position(0);
+        let mut lines = buff.lines();
+        assert!(lines
+            .next()
+            .is_some_and(|line| line.is_ok_and(|line| line.trim() == "Cargo.toml")));
+
+        assert!(lines
+            .next()
+            .is_some_and(|line| line.is_ok_and(|line| line.trim() == "src")));
 
         dir.close()?;
 
