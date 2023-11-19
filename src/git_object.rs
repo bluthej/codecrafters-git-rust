@@ -55,15 +55,16 @@ impl GitObject {
 
         let contents = match obj_type {
             GitObjectType::Tree => {
-                let mut entries = Vec::new();
+                let mut entries = String::new();
                 let mut bytes = rest;
                 while let Some((entry, rest)) =
                     parse_tree_entry(bytes).context("parse tree entry")?
                 {
-                    entries.push(entry.name);
+                    entries.push_str(&entry.name);
+                    entries.push('\n');
                     bytes = rest;
                 }
-                entries.join("\n")
+                entries
             }
             _ => str::from_utf8(rest)
                 .context("convert bytes of contents field to UTF8")?
