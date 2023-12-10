@@ -4,6 +4,7 @@ use flate2::{bufread::ZlibDecoder, write::ZlibEncoder, Compression};
 use sha1::{Digest, Sha1};
 use std::fs::{self, File};
 use std::io::{prelude::*, BufReader};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 mod git_object;
@@ -108,6 +109,94 @@ fn _git_ls_tree<W: Write>(tree_sha: &str, writer: &mut W) -> Result<()> {
     writer.write_all(object.contents.as_bytes())?;
 
     Ok(())
+}
+
+// TODO: clean up these functions!
+pub fn git_write_tree() -> Result<()> {
+    let hash = read_dir(&PathBuf::from("."))?;
+    println!("{}", hex::encode(hash));
+
+    Ok(())
+}
+
+fn read_dir(path: &Path) -> Result<[u8; 20]> {
+    let mut tree = Vec::new();
+    for entry in fs::read_dir(path)? {
+        let entry = entry?.path();
+        if let Some(basename) = entry.file_name().and_then(std::ffi::OsStr::to_str) {
+            if basename.starts_with('.') {
+                continue;
+            }
+            let (mode, hash) = if entry.is_dir() {
+                let hash = read_dir(&entry)?;
+                ("40000", hash)
+                // tree.push(format!("040000 {}\x00{}", basename, hash));
+            } else {
+                let mode = entry.metadata()?.permissions().mode();
+                let is_exec = mode & 0o111 != 0;
+                let mode = if is_exec { "100755" } else { "100644" };
+                let hash = write_blob(&entry)?;
+                (mode, hash)
+            };
+            tree.push((mode, basename.to_string(), hash));
+        }
+    }
+
+    tree.sort_unstable_by_key(|(_, basename, _)| basename.clone());
+    let tree: Vec<u8> = tree
+        .into_iter()
+        .flat_map(|(mode, basename, hash)| {
+            let mut entry = format!("{} {}\x00", mode, basename).as_bytes().to_vec();
+            entry.extend(&hash);
+            entry
+        })
+        .collect();
+
+    let tree = [format!("tree {}\x00", tree.len()).as_bytes(), &tree].concat();
+
+    write_obj(&tree)
+}
+
+fn write_blob(path: &Path) -> Result<[u8; 20]> {
+    // Read file
+    let f = File::open(path)?;
+    let mut reader = BufReader::new(f);
+    let mut file_contents = Vec::new();
+    let bytes = reader.read_to_end(&mut file_contents)?;
+
+    // Add header to create a blob
+    let blob = [format!("blob {}\x00", bytes).as_bytes(), &file_contents].concat();
+
+    write_obj(&blob)
+}
+
+fn write_obj(obj: &[u8]) -> Result<[u8; 20]> {
+    // Create hasher, compute sha1 hash and print it to stdout
+    let mut hasher = Sha1::new();
+    hasher.update(obj);
+    let hash_bytes = hasher.finalize().into();
+    let hash = hex::encode(hash_bytes);
+
+    // Split hash to get dir name and file name (see `git_cat_file`)
+    let (dir_name, file_name) = hash.split_at(2);
+    // Create dir if necessary
+    let dir_path = format!(".git/objects/{}", dir_name);
+    if !PathBuf::from(&dir_path).exists() {
+        fs::create_dir(&dir_path).context("Create directory in .git/objects")?;
+    }
+    let path = format!("{}/{}", dir_path, file_name);
+    // Create file
+    let mut file = File::create(path)?;
+
+    // Create encoder and compress blob
+    let mut e = ZlibEncoder::new(Vec::new(), Compression::default());
+    e.write_all(obj)?;
+    let compressed = e.finish()?;
+
+    // Write blob to file
+    file.write_all(&compressed)?;
+
+    Ok(hash_bytes)
 }
 
 #[cfg(test)]

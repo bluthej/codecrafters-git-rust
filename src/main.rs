@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use git_starter_rust::{git_cat_file, git_hash_object, git_init, git_ls_tree};
+use git_starter_rust::{git_cat_file, git_hash_object, git_init, git_ls_tree, git_write_tree};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -28,6 +28,7 @@ enum Command {
         name_only: bool,
         tree_sha: Option<String>,
     },
+    WriteTree,
 }
 
 fn main() -> Result<()> {
@@ -50,5 +51,6 @@ fn main() -> Result<()> {
             Some(tree_sha) => git_ls_tree(tree_sha),
             None => Ok(()),
         },
+        Command::WriteTree => git_write_tree(),
     }
 }
