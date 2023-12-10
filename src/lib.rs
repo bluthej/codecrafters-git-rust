@@ -12,22 +12,27 @@ mod git_object;
 use git_object::{GitObject, GitObjectType};
 
 pub fn git_init() -> Result<()> {
-    fs::create_dir(".git").context("Create .git directory")?;
-    fs::create_dir(".git/objects").context("Create objects directory")?;
-    fs::create_dir(".git/refs").context("Create refs directory")?;
-    fs::write(".git/HEAD", "ref: refs/heads/master\n").context("Create HEAD file")?;
+    _git_init(Path::new("."))
+}
+
+fn _git_init(path: &Path) -> Result<()> {
+    let dot_git = path.join(".git");
+    fs::create_dir(&dot_git).context("Create .git directory")?;
+    fs::create_dir(dot_git.join("objects")).context("Create objects directory")?;
+    fs::create_dir(dot_git.join("refs")).context("Create refs directory")?;
+    fs::write(dot_git.join("HEAD"), "ref: refs/heads/master\n").context("Create HEAD file")?;
     println!("Initialized git directory");
     Ok(())
 }
 
 // Wrapper function to make the underlying logic testable
 pub fn git_cat_file(blob_sha: &str) -> Result<()> {
-    _git_cat_file(blob_sha, &mut std::io::stdout())
+    _git_cat_file(blob_sha, Path::new("."), &mut std::io::stdout())
 }
 
 // Implementation based on information in https://wyag.thb.lt/#objects
-fn _git_cat_file<W: Write>(blob_sha: &str, writer: &mut W) -> Result<()> {
-    let object_bytes = read_object(blob_sha)?;
+fn _git_cat_file<W: Write>(blob_sha: &str, path: &Path, writer: &mut W) -> Result<()> {
+    let object_bytes = read_object(blob_sha, path)?;
     let object = GitObject::from_bytes(&object_bytes)?;
 
     writer.write_all(object.contents.as_bytes())?;
@@ -35,12 +40,15 @@ fn _git_cat_file<W: Write>(blob_sha: &str, writer: &mut W) -> Result<()> {
     Ok(())
 }
 
-fn read_object(sha: &str) -> Result<Vec<u8>> {
-    let path = PathBuf::from(format!(
-        ".git/objects/{}/{}", // Objects are stored in .git/objects
-        &sha[..2], // They are in a folder named after the first two characters of the hash
-        &sha[2..]  // The remaining characters are used for the file name
-    ));
+fn read_object(sha: &str, path: &Path) -> Result<Vec<u8>> {
+    // Objects are stored in .git/objects
+    // They are in a folder named after the first two characters of the hash
+    // The remaining characters are used for the file name
+    let path = path
+        .join(".git")
+        .join("objects")
+        .join(&sha[..2])
+        .join(&sha[2..]);
 
     let f = File::open(path)?;
     let reader = BufReader::new(f);
@@ -52,13 +60,13 @@ fn read_object(sha: &str) -> Result<Vec<u8>> {
     Ok(buffer)
 }
 
-pub fn git_hash_object(path: &Path) -> Result<()> {
-    _git_hash_object(path, &mut std::io::stdout())
+pub fn git_hash_object(file: &Path) -> Result<()> {
+    _git_hash_object(file, Path::new("."), &mut std::io::stdout())
 }
 
-fn _git_hash_object<W: Write>(path: &Path, writer: &mut W) -> Result<()> {
+fn _git_hash_object<W: Write>(file: &Path, path: &Path, writer: &mut W) -> Result<()> {
     // Read file
-    let f = File::open(path)?;
+    let f = File::open(path.join(file))?;
     let mut reader = BufReader::new(f);
     let mut file_contents = Vec::new();
     let bytes = reader.read_to_end(&mut file_contents)?;
@@ -75,13 +83,13 @@ fn _git_hash_object<W: Write>(path: &Path, writer: &mut W) -> Result<()> {
     // Split hash to get dir name and file name (see `git_cat_file`)
     let (dir_name, file_name) = hash.split_at(2);
     // Create dir if necessary
-    let dir_path = format!(".git/objects/{}", dir_name);
-    if !PathBuf::from(&dir_path).exists() {
+    let dir_path = path.join(".git").join("objects").join(dir_name);
+    if !dir_path.exists() {
         fs::create_dir(&dir_path).context("Create directory in .git/objects")?;
     }
-    let path = format!("{}/{}", dir_path, file_name);
+    let file_path = dir_path.join(file_name);
     // Create file
-    let mut file = File::create(path)?;
+    let mut file = File::create(file_path)?;
 
     // Create encoder and compress blob
     let mut e = ZlibEncoder::new(Vec::new(), Compression::default());
@@ -95,11 +103,11 @@ fn _git_hash_object<W: Write>(path: &Path, writer: &mut W) -> Result<()> {
 }
 
 pub fn git_ls_tree(tree_sha: &str) -> Result<()> {
-    _git_ls_tree(tree_sha, &mut std::io::stdout())
+    _git_ls_tree(tree_sha, Path::new("."), &mut std::io::stdout())
 }
 
-fn _git_ls_tree<W: Write>(tree_sha: &str, writer: &mut W) -> Result<()> {
-    let object_bytes = read_object(tree_sha).context("read object")?;
+fn _git_ls_tree<W: Write>(tree_sha: &str, path: &Path, writer: &mut W) -> Result<()> {
+    let object_bytes = read_object(tree_sha, path).context("read object")?;
     let object = GitObject::from_bytes(&object_bytes).context("parse git object")?;
 
     if object.obj_type != GitObjectType::Tree {
@@ -202,7 +210,6 @@ fn write_obj(obj: &[u8]) -> Result<[u8; 20]> {
 #[cfg(test)]
 mod tests {
     use std::{
-        env::set_current_dir,
         fs::{self, File},
         io::Cursor,
         path::Path,
@@ -271,11 +278,12 @@ mod tests {
         Ok(())
     }
 
-    fn get_sha(path: &str) -> Result<String> {
+    fn get_sha(git_ref: &str, path: &Path) -> Result<String> {
         let output = Command::new("git")
-            .args(["rev-parse", path])
+            .args(["rev-parse", git_ref])
+            .current_dir(path)
             .output()
-            .context(format!("Get hash of {}", path))?;
+            .context(format!("Get hash of {}", git_ref))?;
         if !output.status.success() {
             return Err(anyhow!("Did not get last hash successfully"));
         }
@@ -288,31 +296,30 @@ mod tests {
     #[test]
     fn initialize_repo() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        set_current_dir(dir.path()).context("cd into temporary directory")?;
+        let path = dir.path();
 
-        git_init()?;
+        _git_init(path)?;
 
-        assert!(Path::new("./.git/").is_dir());
-        assert!(Path::new("./.git/objects/").is_dir());
-        assert!(Path::new("./.git/refs/").is_dir());
-        assert!(Path::new("./.git/HEAD").is_file());
+        let dot_git = path.join(".git");
+        assert!(dot_git.is_dir());
+        assert!(dot_git.join("objects").is_dir());
+        assert!(dot_git.join("refs").is_dir());
+        assert!(dot_git.join("HEAD").is_file());
 
         dir.close()?;
 
         Ok(())
     }
 
-    // TODO: figure out why this test fails sometimes
     #[test]
     fn cat_file() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path();
         create_git_repo(path)?;
-        set_current_dir(path).context("cd into temporary directory")?;
-        let hash = get_sha("HEAD")?;
+        let hash = get_sha("HEAD", path)?;
 
         let mut buff = Cursor::new(Vec::new());
-        _git_cat_file(&hash, &mut buff)?;
+        _git_cat_file(&hash, path, &mut buff)?;
 
         buff.set_position(0);
         let mut lines = buff.lines();
@@ -342,10 +349,10 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let path = dir.path();
         create_empty_git_repo(path)?;
-        set_current_dir(path).context("cd into temporary directory")?;
 
         let output = Command::new("touch")
             .arg("main.rs")
+            .current_dir(path)
             .output()
             .context("Create empty file")?;
         if !output.status.success() {
@@ -353,7 +360,7 @@ mod tests {
         }
 
         let mut buff = Cursor::new(Vec::new());
-        _git_hash_object(&PathBuf::from("main.rs"), &mut buff)?;
+        _git_hash_object(&PathBuf::from("main.rs"), path, &mut buff)?;
 
         buff.set_position(0);
         let mut lines = buff.lines();
@@ -361,30 +368,28 @@ mod tests {
             .next()
             .is_some_and(|line| line.is_ok_and(|line| line.trim() == EMPTY_FILE_HASH)));
 
-        assert!(PathBuf::from(format!(
-            ".git/objects/{}/{}",
-            &EMPTY_FILE_HASH[..2],
-            &EMPTY_FILE_HASH[2..]
-        ))
-        .exists());
+        assert!(path
+            .join(".git")
+            .join("objects")
+            .join(&EMPTY_FILE_HASH[..2])
+            .join(&EMPTY_FILE_HASH[2..])
+            .exists());
 
         dir.close()?;
 
         Ok(())
     }
 
-    // TODO: figure out why this test fails sometimes
     #[test]
     fn ls_tree() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path();
         create_git_repo_with_files(path).context("create git repo with files")?;
-        set_current_dir(path).context("cd into temporary directory")?;
         // HEAD is a commit so I have to pass a path in addition to get a tree object
-        let hash = get_sha("HEAD:./")?;
+        let hash = get_sha("HEAD:./", path)?;
 
         let mut buff = Cursor::new(Vec::new());
-        _git_ls_tree(&hash, &mut buff).context("call ls-tree command with hash of root")?;
+        _git_ls_tree(&hash, path, &mut buff).context("call ls-tree command with hash of root")?;
 
         buff.set_position(0);
         let mut lines = buff.lines();
