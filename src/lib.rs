@@ -5,7 +5,7 @@ use sha1::{Digest, Sha1};
 use std::fs::{self, File};
 use std::io::{prelude::*, BufReader};
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 mod git_object;
 
@@ -121,8 +121,12 @@ fn _git_ls_tree<W: Write>(tree_sha: &str, path: &Path, writer: &mut W) -> Result
 
 // TODO: clean up these functions!
 pub fn git_write_tree() -> Result<()> {
-    let hash = read_dir(&PathBuf::from("."))?;
-    println!("{}", hex::encode(hash));
+    _git_write_tree(Path::new("."), &mut std::io::stdout())
+}
+
+fn _git_write_tree<W: Write>(path: &Path, writer: &mut W) -> Result<()> {
+    let hash = read_dir(path)?;
+    writer.write_all(hex::encode(hash).as_bytes())?;
 
     Ok(())
 }
@@ -143,7 +147,7 @@ fn read_dir(path: &Path) -> Result<[u8; 20]> {
                 let mode = entry.metadata()?.permissions().mode();
                 let is_exec = mode & 0o111 != 0;
                 let mode = if is_exec { "100755" } else { "100644" };
-                let hash = write_blob(&entry)?;
+                let hash = write_blob(&entry, path)?;
                 (mode, hash)
             };
             tree.push((mode, basename.to_string(), hash));
@@ -162,12 +166,12 @@ fn read_dir(path: &Path) -> Result<[u8; 20]> {
 
     let tree = [format!("tree {}\x00", tree.len()).as_bytes(), &tree].concat();
 
-    write_obj(&tree)
+    write_obj(&tree, path)
 }
 
-fn write_blob(path: &Path) -> Result<[u8; 20]> {
+fn write_blob(file: &Path, path: &Path) -> Result<[u8; 20]> {
     // Read file
-    let f = File::open(path)?;
+    let f = File::open(file)?;
     let mut reader = BufReader::new(f);
     let mut file_contents = Vec::new();
     let bytes = reader.read_to_end(&mut file_contents)?;
@@ -175,10 +179,10 @@ fn write_blob(path: &Path) -> Result<[u8; 20]> {
     // Add header to create a blob
     let blob = [format!("blob {}\x00", bytes).as_bytes(), &file_contents].concat();
 
-    write_obj(&blob)
+    write_obj(&blob, path)
 }
 
-fn write_obj(obj: &[u8]) -> Result<[u8; 20]> {
+fn write_obj(obj: &[u8], path: &Path) -> Result<[u8; 20]> {
     // Create hasher, compute sha1 hash and print it to stdout
     let mut hasher = Sha1::new();
     hasher.update(obj);
@@ -188,13 +192,13 @@ fn write_obj(obj: &[u8]) -> Result<[u8; 20]> {
     // Split hash to get dir name and file name (see `git_cat_file`)
     let (dir_name, file_name) = hash.split_at(2);
     // Create dir if necessary
-    let dir_path = format!(".git/objects/{}", dir_name);
-    if !PathBuf::from(&dir_path).exists() {
-        fs::create_dir(&dir_path).context("Create directory in .git/objects")?;
+    let dir_path = path.join(".git").join("objects").join(dir_name);
+    if !dir_path.exists() {
+        fs::create_dir_all(&dir_path).context("Create directory in .git/objects")?;
     }
-    let path = format!("{}/{}", dir_path, file_name);
+    let file_path = dir_path.join(file_name);
     // Create file
-    let mut file = File::create(path)?;
+    let mut file = File::create(file_path)?;
 
     // Create encoder and compress blob
     let mut e = ZlibEncoder::new(Vec::new(), Compression::default());
@@ -212,7 +216,7 @@ mod tests {
     use std::{
         fs::{self, File},
         io::Cursor,
-        path::Path,
+        path::{Path, PathBuf},
         process::Command,
     };
 
@@ -221,6 +225,7 @@ mod tests {
     use super::*;
 
     const EMPTY_FILE_HASH: &str = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+    const REPO_WITH_UNCOMMITED_FILES_HASH: &str = "7fa1ce0ba9e8fcc9d83854e44f48f0f25c477a1c";
 
     pub fn create_empty_git_repo(path: &Path) -> Result<()> {
         let output = Command::new("git")
@@ -250,12 +255,19 @@ mod tests {
         Ok(())
     }
 
-    fn create_git_repo_with_files(path: &Path) -> Result<()> {
+    fn create_git_repo_with_uncommited_files(path: &Path) -> Result<()> {
         create_empty_git_repo(path)?;
 
         fs::create_dir(path.join("src"))?;
         let _ = File::create(path.join("src").join("main.rs"))?;
         let _ = File::create(path.join("Cargo.toml"))?;
+
+        Ok(())
+    }
+
+    fn create_git_repo_with_files(path: &Path) -> Result<()> {
+        create_git_repo_with_uncommited_files(path)
+            .context("Create git repo with uncommited files")?;
 
         let output = Command::new("git")
             .args(["add", "."])
@@ -402,6 +414,33 @@ mod tests {
             .is_some_and(|line| line.is_ok_and(|line| line.trim() == "src")));
 
         dir.close()?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn write_tree() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path();
+        create_git_repo_with_uncommited_files(path)
+            .context("create git repo with uncommited files")?;
+
+        let mut buff = Cursor::new(Vec::new());
+        _git_write_tree(path, &mut buff).context("call write-tree command")?;
+
+        buff.set_position(0);
+        let mut lines = buff.lines();
+        let hash = REPO_WITH_UNCOMMITED_FILES_HASH;
+        assert!(lines
+            .next()
+            .is_some_and(|line| line.is_ok_and(|line| line.trim() == hash)));
+        let objects = path.join(".git").join("objects");
+        for entry in fs::read_dir(&objects)? {
+            eprintln!("{entry:?}");
+        }
+
+        assert!(objects.join(&hash[..2]).is_dir());
+        assert!(objects.join(&hash[..2]).join(&hash[2..]).exists());
 
         Ok(())
     }
