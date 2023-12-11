@@ -65,39 +65,9 @@ pub fn git_hash_object(file: &Path) -> Result<()> {
 }
 
 fn _git_hash_object<W: Write>(file: &Path, path: &Path, writer: &mut W) -> Result<()> {
-    // Read file
-    let f = File::open(path.join(file))?;
-    let mut reader = BufReader::new(f);
-    let mut file_contents = Vec::new();
-    let bytes = reader.read_to_end(&mut file_contents)?;
+    let hash_bytes = write_blob(file, path)?;
 
-    // Add header to create a blob
-    let blob = [format!("blob {}\x00", bytes).as_bytes(), &file_contents].concat();
-
-    // Create hasher, compute sha1 hash and print it to stdout
-    let mut hasher = Sha1::new();
-    hasher.update(&blob);
-    let hash = hex::encode(hasher.finalize());
-    writer.write_all(hash.as_bytes())?;
-
-    // Split hash to get dir name and file name (see `git_cat_file`)
-    let (dir_name, file_name) = hash.split_at(2);
-    // Create dir if necessary
-    let dir_path = path.join(".git").join("objects").join(dir_name);
-    if !dir_path.exists() {
-        fs::create_dir(&dir_path).context("Create directory in .git/objects")?;
-    }
-    let file_path = dir_path.join(file_name);
-    // Create file
-    let mut file = File::create(file_path)?;
-
-    // Create encoder and compress blob
-    let mut e = ZlibEncoder::new(Vec::new(), Compression::default());
-    e.write_all(&blob)?;
-    let compressed = e.finish()?;
-
-    // Write blob to file
-    file.write_all(&compressed)?;
+    writer.write_all(hex::encode(hash_bytes).as_bytes())?;
 
     Ok(())
 }
@@ -171,7 +141,7 @@ fn read_dir(path: &Path) -> Result<[u8; 20]> {
 
 fn write_blob(file: &Path, path: &Path) -> Result<[u8; 20]> {
     // Read file
-    let f = File::open(file)?;
+    let f = File::open(path.join(file))?;
     let mut reader = BufReader::new(f);
     let mut file_contents = Vec::new();
     let bytes = reader.read_to_end(&mut file_contents)?;
