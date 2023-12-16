@@ -1,7 +1,6 @@
 #[allow(unused)]
 use anyhow::{anyhow, Context, Result};
-use flate2::{bufread::ZlibDecoder, write::ZlibEncoder, Compression};
-use sha1::{Digest, Sha1};
+use flate2::bufread::ZlibDecoder;
 use std::fs::{self, File};
 use std::io::{prelude::*, BufReader};
 use std::os::unix::fs::PermissionsExt;
@@ -108,7 +107,7 @@ fn _git_write_tree<W: Write>(root: &Path, writer: &mut W) -> Result<()> {
 }
 
 fn read_dir(root: &Path) -> Result<[u8; 20]> {
-    let mut tree = Vec::new();
+    let mut entries = Vec::new();
     for entry in fs::read_dir(root)? {
         let entry = entry?.path();
         if let Some(basename) = entry.file_name().and_then(std::ffi::OsStr::to_str) {
@@ -122,7 +121,9 @@ fn read_dir(root: &Path) -> Result<[u8; 20]> {
                 let mode = entry.metadata()?.permissions().mode();
                 let is_exec = mode & 0o111 != 0;
                 let mode = if is_exec { 100755 } else { 100644 };
-                let hash = write_blob(&entry, root)?;
+                let blob = Object::blobify(&entry, root)?;
+                let hash = blob.hash();
+                blob.write(root)?;
                 (mode, hash)
             };
             let tree_entry = TreeEntry {
@@ -130,68 +131,17 @@ fn read_dir(root: &Path) -> Result<[u8; 20]> {
                 name: basename.to_string(),
                 sha1: hash.to_vec(),
             };
-            tree.push(tree_entry);
+            entries.push(tree_entry);
         }
     }
 
-    tree.sort_unstable_by_key(|tree_entry| tree_entry.name.clone());
+    entries.sort_unstable_by_key(|tree_entry| tree_entry.name.clone());
 
-    // let tree: Vec<u8> = tree
-    //     .into_iter()
-    //     .flat_map(|TreeEntry { mode, name, sha1 }| {
-    //         let mut entry = format!("{} {}\x00", mode, name).as_bytes().to_vec();
-    //         entry.extend(&sha1);
-    //         entry
-    //     })
-    //     .collect();
+    let tree = Object::Tree(entries);
+    let hash = tree.hash();
+    tree.write(root)?;
 
-    // let tree = [format!("tree {}\x00", tree.len()).as_bytes(), &tree].concat();
-
-    let bytes = Object::Tree(tree).to_bytes();
-
-    write_obj(&bytes, root)
-}
-
-fn write_blob(file: &Path, path: &Path) -> Result<[u8; 20]> {
-    // Read file
-    let f = File::open(path.join(file))?;
-    let mut reader = BufReader::new(f);
-    let mut file_contents = Vec::new();
-    let bytes = reader.read_to_end(&mut file_contents)?;
-
-    // Add header to create a blob
-    let blob = [format!("blob {}\x00", bytes).as_bytes(), &file_contents].concat();
-
-    write_obj(&blob, path)
-}
-
-fn write_obj(obj: &[u8], path: &Path) -> Result<[u8; 20]> {
-    // Create hasher, compute sha1 hash and print it to stdout
-    let mut hasher = Sha1::new();
-    hasher.update(obj);
-    let hash_bytes = hasher.finalize().into();
-    let hash = hex::encode(hash_bytes);
-
-    // Split hash to get dir name and file name (see `git_cat_file`)
-    let (dir_name, file_name) = hash.split_at(2);
-    // Create dir if necessary
-    let dir_path = path.join(".git").join("objects").join(dir_name);
-    if !dir_path.exists() {
-        fs::create_dir_all(&dir_path).context("Create directory in .git/objects")?;
-    }
-    let file_path = dir_path.join(file_name);
-    // Create file
-    let mut file = File::create(file_path)?;
-
-    // Create encoder and compress blob
-    let mut e = ZlibEncoder::new(Vec::new(), Compression::default());
-    e.write_all(obj)?;
-    let compressed = e.finish()?;
-
-    // Write blob to file
-    file.write_all(&compressed)?;
-
-    Ok(hash_bytes)
+    Ok(hash)
 }
 
 #[cfg(test)]
