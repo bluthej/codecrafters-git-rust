@@ -127,13 +127,27 @@ pub(crate) struct Tree(Vec<TreeNode>);
 
 struct TreeNode {
     name: String,
-    mode: usize,
     kind: TreeNodeKind,
 }
 
 enum TreeNodeKind {
-    Blob(Object),
+    Blob { obj: Object, is_executable: bool },
     Tree(Tree),
+}
+
+impl TreeNodeKind {
+    fn mode(&self) -> usize {
+        match self {
+            TreeNodeKind::Blob { is_executable, .. } => {
+                if *is_executable {
+                    100755
+                } else {
+                    100644
+                }
+            }
+            TreeNodeKind::Tree(_) => 40000,
+        }
+    }
 }
 
 impl Tree {
@@ -145,19 +159,20 @@ impl Tree {
                 if basename.starts_with('.') {
                     continue;
                 }
-                let (mode, kind) = if entry.is_dir() {
+                let kind = if entry.is_dir() {
                     let sub_tree = Tree::from_working_directory(&entry)?;
-                    (40000, TreeNodeKind::Tree(sub_tree))
+                    TreeNodeKind::Tree(sub_tree)
                 } else {
                     let blob = Object::blobify(&entry)?;
                     let mode = entry.metadata()?.permissions().mode();
-                    let is_exec = mode & 0o111 != 0;
-                    let mode = if is_exec { 100755 } else { 100644 };
-                    (mode, TreeNodeKind::Blob(blob))
+                    let is_executable = mode & 0o111 != 0;
+                    TreeNodeKind::Blob {
+                        obj: blob,
+                        is_executable,
+                    }
                 };
                 tree.push(TreeNode {
                     name: basename.to_string(),
-                    mode,
                     kind,
                 });
             }
@@ -170,11 +185,11 @@ impl Tree {
         let mut entries = Vec::new();
         for node in &self.0 {
             let hash = match &node.kind {
-                TreeNodeKind::Blob(blob) => blob.hash(),
+                TreeNodeKind::Blob { obj, .. } => obj.hash(),
                 TreeNodeKind::Tree(tree) => tree.write(root)?,
             };
             let tree_entry = TreeEntry {
-                mode: node.mode,
+                mode: node.kind.mode(),
                 name: node.name.clone(),
                 hash: hash.to_vec(),
             };
