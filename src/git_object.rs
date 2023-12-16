@@ -125,16 +125,15 @@ impl Object {
 
 pub(crate) struct Tree(Vec<TreeNode>);
 
-enum TreeNode {
-    Blob {
-        name: String,
-        obj: Object,
-        mode: usize,
-    },
-    Tree {
-        name: String,
-        obj: Tree,
-    },
+struct TreeNode {
+    name: String,
+    mode: usize,
+    kind: TreeNodeKind,
+}
+
+enum TreeNodeKind {
+    Blob(Object),
+    Tree(Tree),
 }
 
 impl Tree {
@@ -146,23 +145,21 @@ impl Tree {
                 if basename.starts_with('.') {
                     continue;
                 }
-                if entry.is_dir() {
+                let (mode, kind) = if entry.is_dir() {
                     let sub_tree = Tree::from_working_directory(&entry)?;
-                    tree.push(TreeNode::Tree {
-                        name: basename.to_string(),
-                        obj: sub_tree,
-                    });
+                    (40000, TreeNodeKind::Tree(sub_tree))
                 } else {
                     let blob = Object::blobify(&entry, path)?;
                     let mode = entry.metadata()?.permissions().mode();
                     let is_exec = mode & 0o111 != 0;
                     let mode = if is_exec { 100755 } else { 100644 };
-                    tree.push(TreeNode::Blob {
-                        name: basename.to_string(),
-                        obj: blob,
-                        mode,
-                    });
+                    (mode, TreeNodeKind::Blob(blob))
                 };
+                tree.push(TreeNode {
+                    name: basename.to_string(),
+                    mode,
+                    kind,
+                });
             }
         }
 
@@ -172,17 +169,14 @@ impl Tree {
     pub(crate) fn write(&self, root: &Path) -> Result<[u8; 20]> {
         let mut entries = Vec::new();
         for node in &self.0 {
-            let (mode, name, hash) = match node {
-                TreeNode::Blob { name, obj, mode } => {
-                    obj.write(root)?;
-                    (*mode, name, obj.hash())
-                }
-                TreeNode::Tree { name, obj } => (40000, name, obj.write(root)?),
+            let hash = match &node.kind {
+                TreeNodeKind::Blob(blob) => blob.hash(),
+                TreeNodeKind::Tree(tree) => tree.write(root)?,
             };
             let tree_entry = TreeEntry {
-                mode,
-                name: name.to_string(),
-                sha1: hash.to_vec(),
+                mode: node.mode,
+                name: node.name.clone(),
+                hash: hash.to_vec(),
             };
             entries.push(tree_entry);
         }
@@ -201,7 +195,7 @@ impl Tree {
 pub(crate) struct TreeEntry {
     pub mode: usize,
     pub name: String,
-    pub sha1: Vec<u8>,
+    pub hash: Vec<u8>,
 }
 
 impl TreeEntry {
@@ -222,14 +216,21 @@ impl TreeEntry {
 
         let sha1 = hex::encode(&rest[..20]).as_bytes().to_owned();
 
-        Ok(Some((Self { mode, name, sha1 }, &rest[20..])))
+        Ok(Some((
+            Self {
+                mode,
+                name,
+                hash: sha1,
+            },
+            &rest[20..],
+        )))
     }
 
     fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = format!("{} {}\x00", self.mode, self.name)
             .as_bytes()
             .to_owned();
-        bytes.extend(&self.sha1);
+        bytes.extend(&self.hash);
         bytes
     }
 }
