@@ -3,12 +3,11 @@ use anyhow::{anyhow, Context, Result};
 use flate2::bufread::ZlibDecoder;
 use std::fs::{self, File};
 use std::io::{prelude::*, BufReader};
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 mod git_object;
 
-use git_object::{Object, TreeEntry};
+use git_object::{Object, Tree};
 
 pub fn git_init() -> Result<()> {
     _git_init(Path::new("."))
@@ -94,54 +93,17 @@ fn _git_ls_tree<W: Write>(tree_sha: &str, root: &Path, writer: &mut W) -> Result
     Ok(())
 }
 
-// TODO: clean up these functions!
 pub fn git_write_tree() -> Result<()> {
     _git_write_tree(Path::new("."), &mut std::io::stdout())
 }
 
 fn _git_write_tree<W: Write>(root: &Path, writer: &mut W) -> Result<()> {
-    let hash = read_dir(root)?;
+    let tree = Tree::from_working_directory(root)?;
+    let hash = tree.write(root)?;
+
     writer.write_all(hex::encode(hash).as_bytes())?;
 
     Ok(())
-}
-
-fn read_dir(root: &Path) -> Result<[u8; 20]> {
-    let mut entries = Vec::new();
-    for entry in fs::read_dir(root)? {
-        let entry = entry?.path();
-        if let Some(basename) = entry.file_name().and_then(std::ffi::OsStr::to_str) {
-            if basename.starts_with('.') {
-                continue;
-            }
-            let (mode, hash) = if entry.is_dir() {
-                let hash = read_dir(&entry)?;
-                (40000, hash)
-            } else {
-                let mode = entry.metadata()?.permissions().mode();
-                let is_exec = mode & 0o111 != 0;
-                let mode = if is_exec { 100755 } else { 100644 };
-                let blob = Object::blobify(&entry, root)?;
-                let hash = blob.hash();
-                blob.write(root)?;
-                (mode, hash)
-            };
-            let tree_entry = TreeEntry {
-                mode,
-                name: basename.to_string(),
-                sha1: hash.to_vec(),
-            };
-            entries.push(tree_entry);
-        }
-    }
-
-    entries.sort_unstable_by_key(|tree_entry| tree_entry.name.clone());
-
-    let tree = Object::Tree(entries);
-    let hash = tree.hash();
-    tree.write(root)?;
-
-    Ok(hash)
 }
 
 #[cfg(test)]

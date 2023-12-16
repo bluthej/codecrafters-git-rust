@@ -3,6 +3,7 @@ use flate2::{write::ZlibEncoder, Compression};
 use sha1::{Digest, Sha1};
 use std::fs::{self, File};
 use std::io::{prelude::*, BufReader, Read};
+use std::os::unix::prelude::PermissionsExt;
 use std::path::Path;
 use std::str;
 
@@ -98,7 +99,7 @@ impl Object {
         hasher.finalize().into()
     }
 
-    pub(crate) fn write(self, root: &Path) -> Result<()> {
+    pub(crate) fn write(&self, root: &Path) -> Result<()> {
         let hash = hex::encode(self.hash());
 
         let (dir_name, file_name) = hash.split_at(2);
@@ -119,6 +120,80 @@ impl Object {
         file.write_all(&compressed)?;
 
         Ok(())
+    }
+}
+
+pub(crate) struct Tree(Vec<TreeNode>);
+
+enum TreeNode {
+    Blob {
+        name: String,
+        obj: Object,
+        mode: usize,
+    },
+    Tree {
+        name: String,
+        obj: Tree,
+    },
+}
+
+impl Tree {
+    pub(crate) fn from_working_directory(path: &Path) -> Result<Self> {
+        let mut tree = Vec::new();
+        for entry in fs::read_dir(path)? {
+            let entry = entry?.path();
+            if let Some(basename) = entry.file_name().and_then(std::ffi::OsStr::to_str) {
+                if basename.starts_with('.') {
+                    continue;
+                }
+                if entry.is_dir() {
+                    let sub_tree = Tree::from_working_directory(&entry)?;
+                    tree.push(TreeNode::Tree {
+                        name: basename.to_string(),
+                        obj: sub_tree,
+                    });
+                } else {
+                    let blob = Object::blobify(&entry, path)?;
+                    let mode = entry.metadata()?.permissions().mode();
+                    let is_exec = mode & 0o111 != 0;
+                    let mode = if is_exec { 100755 } else { 100644 };
+                    tree.push(TreeNode::Blob {
+                        name: basename.to_string(),
+                        obj: blob,
+                        mode,
+                    });
+                };
+            }
+        }
+
+        Ok(Self(tree))
+    }
+
+    pub(crate) fn write(&self, root: &Path) -> Result<[u8; 20]> {
+        let mut entries = Vec::new();
+        for node in &self.0 {
+            let (mode, name, hash) = match node {
+                TreeNode::Blob { name, obj, mode } => {
+                    obj.write(root)?;
+                    (*mode, name, obj.hash())
+                }
+                TreeNode::Tree { name, obj } => (40000, name, obj.write(root)?),
+            };
+            let tree_entry = TreeEntry {
+                mode,
+                name: name.to_string(),
+                sha1: hash.to_vec(),
+            };
+            entries.push(tree_entry);
+        }
+
+        entries.sort_unstable_by_key(|tree_entry| tree_entry.name.clone());
+
+        let tree = Object::Tree(entries);
+        let hash = tree.hash();
+        tree.write(root)?;
+
+        Ok(hash)
     }
 }
 
