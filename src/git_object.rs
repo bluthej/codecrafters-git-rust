@@ -15,8 +15,8 @@ pub(crate) enum Object {
 }
 
 impl Object {
-    pub(crate) fn blobify(file: &Path, root: &Path) -> Result<Self> {
-        let f = File::open(root.join(file))?;
+    pub(crate) fn blobify(file: &Path) -> Result<Self> {
+        let f = File::open(file)?;
         let mut reader = BufReader::new(f);
         let mut contents = String::new();
         let _bytes = reader.read_to_string(&mut contents)?;
@@ -149,7 +149,7 @@ impl Tree {
                     let sub_tree = Tree::from_working_directory(&entry)?;
                     (40000, TreeNodeKind::Tree(sub_tree))
                 } else {
-                    let blob = Object::blobify(&entry, path)?;
+                    let blob = Object::blobify(&entry)?;
                     let mode = entry.metadata()?.permissions().mode();
                     let is_exec = mode & 0o111 != 0;
                     let mode = if is_exec { 100755 } else { 100644 };

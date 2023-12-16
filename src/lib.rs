@@ -64,7 +64,7 @@ pub fn git_hash_object(file: &Path) -> Result<()> {
 }
 
 fn _git_hash_object<W: Write>(file: &Path, root: &Path, writer: &mut W) -> Result<()> {
-    let blob = Object::blobify(file, root)?;
+    let blob = Object::blobify(&root.join(file))?;
     let hash = blob.hash();
     blob.write(root)?;
     writer.write_all(hex::encode(hash).as_bytes())?;
@@ -99,10 +99,12 @@ pub fn git_write_tree() -> Result<()> {
 }
 
 fn _git_write_tree<W: Write>(root: &Path, writer: &mut W) -> Result<()> {
-    let tree = Tree::from_working_directory(root)?;
+    let tree = Tree::from_working_directory(root).context("create tree from working directory")?;
     let hash = tree.write(root)?;
 
-    writer.write_all(hex::encode(hash).as_bytes())?;
+    writer
+        .write_all(hex::encode(hash).as_bytes())
+        .context("write hash")?;
 
     Ok(())
 }
