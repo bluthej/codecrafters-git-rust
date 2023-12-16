@@ -9,14 +9,14 @@ use std::path::Path;
 
 mod git_object;
 
-use git_object::{GitObject, GitObjectType};
+use git_object::{Object, TreeEntry};
 
 pub fn git_init() -> Result<()> {
     _git_init(Path::new("."))
 }
 
-fn _git_init(path: &Path) -> Result<()> {
-    let dot_git = path.join(".git");
+fn _git_init(root: &Path) -> Result<()> {
+    let dot_git = root.join(".git");
     fs::create_dir(&dot_git).context("Create .git directory")?;
     fs::create_dir(dot_git.join("objects")).context("Create objects directory")?;
     fs::create_dir(dot_git.join("refs")).context("Create refs directory")?;
@@ -31,20 +31,20 @@ pub fn git_cat_file(blob_sha: &str) -> Result<()> {
 }
 
 // Implementation based on information in https://wyag.thb.lt/#objects
-fn _git_cat_file<W: Write>(blob_sha: &str, path: &Path, writer: &mut W) -> Result<()> {
-    let object_bytes = read_object(blob_sha, path)?;
-    let object = GitObject::from_bytes(&object_bytes)?;
+fn _git_cat_file<W: Write>(blob_sha: &str, root: &Path, writer: &mut W) -> Result<()> {
+    let bytes = read_object(blob_sha, root)?;
+    let object = Object::from_bytes(&bytes)?;
 
-    writer.write_all(object.contents.as_bytes())?;
+    writer.write_all(&object.content_bytes())?;
 
     Ok(())
 }
 
-fn read_object(sha: &str, path: &Path) -> Result<Vec<u8>> {
+fn read_object(sha: &str, root: &Path) -> Result<Vec<u8>> {
     // Objects are stored in .git/objects
     // They are in a folder named after the first two characters of the hash
     // The remaining characters are used for the file name
-    let path = path
+    let path = root
         .join(".git")
         .join("objects")
         .join(&sha[..2])
@@ -64,10 +64,11 @@ pub fn git_hash_object(file: &Path) -> Result<()> {
     _git_hash_object(file, Path::new("."), &mut std::io::stdout())
 }
 
-fn _git_hash_object<W: Write>(file: &Path, path: &Path, writer: &mut W) -> Result<()> {
-    let hash_bytes = write_blob(file, path)?;
-
-    writer.write_all(hex::encode(hash_bytes).as_bytes())?;
+fn _git_hash_object<W: Write>(file: &Path, root: &Path, writer: &mut W) -> Result<()> {
+    let blob = Object::blobify(file, root)?;
+    let hash = blob.hash();
+    blob.write(root)?;
+    writer.write_all(hex::encode(hash).as_bytes())?;
 
     Ok(())
 }
@@ -76,15 +77,20 @@ pub fn git_ls_tree(tree_sha: &str) -> Result<()> {
     _git_ls_tree(tree_sha, Path::new("."), &mut std::io::stdout())
 }
 
-fn _git_ls_tree<W: Write>(tree_sha: &str, path: &Path, writer: &mut W) -> Result<()> {
-    let object_bytes = read_object(tree_sha, path).context("read object")?;
-    let object = GitObject::from_bytes(&object_bytes).context("parse git object")?;
+fn _git_ls_tree<W: Write>(tree_sha: &str, root: &Path, writer: &mut W) -> Result<()> {
+    let object_bytes = read_object(tree_sha, root).context("read object")?;
+    let object = Object::from_bytes(&object_bytes).context("parse git object")?;
 
-    if object.obj_type != GitObjectType::Tree {
-        return Err(anyhow!("Expected `tree` object, got: {}", object.obj_type));
-    }
+    let Object::Tree(entries) = object else {
+        return Err(anyhow!("Expected `tree` object, got: {}", object.kind()));
+    };
 
-    writer.write_all(object.contents.as_bytes())?;
+    let bytes: Vec<u8> = entries
+        .into_iter()
+        .flat_map(|entry| format!("{}\n", entry.name).as_bytes().to_owned())
+        .collect();
+
+    writer.write_all(&bytes)?;
 
     Ok(())
 }
@@ -94,16 +100,16 @@ pub fn git_write_tree() -> Result<()> {
     _git_write_tree(Path::new("."), &mut std::io::stdout())
 }
 
-fn _git_write_tree<W: Write>(path: &Path, writer: &mut W) -> Result<()> {
-    let hash = read_dir(path)?;
+fn _git_write_tree<W: Write>(root: &Path, writer: &mut W) -> Result<()> {
+    let hash = read_dir(root)?;
     writer.write_all(hex::encode(hash).as_bytes())?;
 
     Ok(())
 }
 
-fn read_dir(path: &Path) -> Result<[u8; 20]> {
+fn read_dir(root: &Path) -> Result<[u8; 20]> {
     let mut tree = Vec::new();
-    for entry in fs::read_dir(path)? {
+    for entry in fs::read_dir(root)? {
         let entry = entry?.path();
         if let Some(basename) = entry.file_name().and_then(std::ffi::OsStr::to_str) {
             if basename.starts_with('.') {
@@ -111,32 +117,39 @@ fn read_dir(path: &Path) -> Result<[u8; 20]> {
             }
             let (mode, hash) = if entry.is_dir() {
                 let hash = read_dir(&entry)?;
-                ("40000", hash)
-                // tree.push(format!("040000 {}\x00{}", basename, hash));
+                (40000, hash)
             } else {
                 let mode = entry.metadata()?.permissions().mode();
                 let is_exec = mode & 0o111 != 0;
-                let mode = if is_exec { "100755" } else { "100644" };
-                let hash = write_blob(&entry, path)?;
+                let mode = if is_exec { 100755 } else { 100644 };
+                let hash = write_blob(&entry, root)?;
                 (mode, hash)
             };
-            tree.push((mode, basename.to_string(), hash));
+            let tree_entry = TreeEntry {
+                mode,
+                name: basename.to_string(),
+                sha1: hash.to_vec(),
+            };
+            tree.push(tree_entry);
         }
     }
 
-    tree.sort_unstable_by_key(|(_, basename, _)| basename.clone());
-    let tree: Vec<u8> = tree
-        .into_iter()
-        .flat_map(|(mode, basename, hash)| {
-            let mut entry = format!("{} {}\x00", mode, basename).as_bytes().to_vec();
-            entry.extend(&hash);
-            entry
-        })
-        .collect();
+    tree.sort_unstable_by_key(|tree_entry| tree_entry.name.clone());
 
-    let tree = [format!("tree {}\x00", tree.len()).as_bytes(), &tree].concat();
+    // let tree: Vec<u8> = tree
+    //     .into_iter()
+    //     .flat_map(|TreeEntry { mode, name, sha1 }| {
+    //         let mut entry = format!("{} {}\x00", mode, name).as_bytes().to_vec();
+    //         entry.extend(&sha1);
+    //         entry
+    //     })
+    //     .collect();
 
-    write_obj(&tree, path)
+    // let tree = [format!("tree {}\x00", tree.len()).as_bytes(), &tree].concat();
+
+    let bytes = Object::Tree(tree).to_bytes();
+
+    write_obj(&bytes, root)
 }
 
 fn write_blob(file: &Path, path: &Path) -> Result<[u8; 20]> {
@@ -278,11 +291,11 @@ mod tests {
     #[test]
     fn initialize_repo() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let path = dir.path();
+        let root = dir.path();
 
-        _git_init(path)?;
+        _git_init(root)?;
 
-        let dot_git = path.join(".git");
+        let dot_git = root.join(".git");
         assert!(dot_git.is_dir());
         assert!(dot_git.join("objects").is_dir());
         assert!(dot_git.join("refs").is_dir());
@@ -296,12 +309,12 @@ mod tests {
     #[test]
     fn cat_file() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let path = dir.path();
-        create_git_repo(path)?;
-        let hash = get_sha("HEAD", path)?;
+        let root = dir.path();
+        create_git_repo(root)?;
+        let hash = get_sha("HEAD", root)?;
 
         let mut buff = Cursor::new(Vec::new());
-        _git_cat_file(&hash, path, &mut buff)?;
+        _git_cat_file(&hash, root, &mut buff)?;
 
         buff.set_position(0);
         let mut lines = buff.lines();
@@ -329,12 +342,12 @@ mod tests {
     #[test]
     fn hash_object() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let path = dir.path();
-        create_empty_git_repo(path)?;
+        let root = dir.path();
+        create_empty_git_repo(root)?;
 
         let output = Command::new("touch")
             .arg("main.rs")
-            .current_dir(path)
+            .current_dir(root)
             .output()
             .context("Create empty file")?;
         if !output.status.success() {
@@ -342,7 +355,7 @@ mod tests {
         }
 
         let mut buff = Cursor::new(Vec::new());
-        _git_hash_object(&PathBuf::from("main.rs"), path, &mut buff)?;
+        _git_hash_object(&PathBuf::from("main.rs"), root, &mut buff)?;
 
         buff.set_position(0);
         let mut lines = buff.lines();
@@ -350,7 +363,7 @@ mod tests {
             .next()
             .is_some_and(|line| line.is_ok_and(|line| line.trim() == EMPTY_FILE_HASH)));
 
-        assert!(path
+        assert!(root
             .join(".git")
             .join("objects")
             .join(&EMPTY_FILE_HASH[..2])
@@ -365,13 +378,13 @@ mod tests {
     #[test]
     fn ls_tree() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let path = dir.path();
-        create_git_repo_with_files(path).context("create git repo with files")?;
+        let root = dir.path();
+        create_git_repo_with_files(root).context("create git repo with files")?;
         // HEAD is a commit so I have to pass a path in addition to get a tree object
-        let hash = get_sha("HEAD:./", path)?;
+        let hash = get_sha("HEAD:./", root)?;
 
         let mut buff = Cursor::new(Vec::new());
-        _git_ls_tree(&hash, path, &mut buff).context("call ls-tree command with hash of root")?;
+        _git_ls_tree(&hash, root, &mut buff).context("call ls-tree command with hash of root")?;
 
         buff.set_position(0);
         let mut lines = buff.lines();
@@ -391,20 +404,23 @@ mod tests {
     #[test]
     fn write_tree() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let path = dir.path();
-        create_git_repo_with_uncommited_files(path)
+        let root = dir.path();
+        create_git_repo_with_uncommited_files(root)
             .context("create git repo with uncommited files")?;
 
         let mut buff = Cursor::new(Vec::new());
-        _git_write_tree(path, &mut buff).context("call write-tree command")?;
+        _git_write_tree(root, &mut buff).context("call write-tree command")?;
 
         buff.set_position(0);
+        for line in buff.clone().lines() {
+            dbg!(&line?);
+        }
         let mut lines = buff.lines();
         let hash = REPO_WITH_UNCOMMITED_FILES_HASH;
         assert!(lines
             .next()
             .is_some_and(|line| line.is_ok_and(|line| line.trim() == hash)));
-        let objects = path.join(".git").join("objects");
+        let objects = root.join(".git").join("objects");
         for entry in fs::read_dir(&objects)? {
             eprintln!("{entry:?}");
         }

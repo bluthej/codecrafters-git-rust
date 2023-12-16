@@ -1,102 +1,162 @@
 use anyhow::{anyhow, Context, Ok, Result};
-use std::fmt::Display;
+use flate2::{write::ZlibEncoder, Compression};
+use sha1::{Digest, Sha1};
+use std::fs::{self, File};
+use std::io::{prelude::*, BufReader, Read};
+use std::path::Path;
 use std::str;
 
-#[allow(dead_code)]
-pub(crate) struct GitObject {
-    pub(crate) obj_type: GitObjectType,
-    pub(crate) size: usize,
-    pub(crate) contents: String,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum GitObjectType {
-    Blob,
-    Commit,
+pub(crate) enum Object {
+    Blob(String),
+    Commit(Vec<u8>),
     Tag,
-    Tree,
+    Tree(Vec<TreeEntry>),
 }
 
-#[derive(Debug)]
-struct TreeEntry {
-    #[allow(unused)]
-    mode: usize,
-    name: String,
-    #[allow(unused)]
-    sha1: String,
-}
+impl Object {
+    pub(crate) fn blobify(file: &Path, root: &Path) -> Result<Self> {
+        let f = File::open(root.join(file))?;
+        let mut reader = BufReader::new(f);
+        let mut contents = String::new();
+        let _bytes = reader.read_to_string(&mut contents)?;
+        Ok(Self::Blob(contents))
+    }
 
-impl GitObject {
-    // A git object is made up of:
-    // - the object type (blob, commit, tag or tree)
-    // - an ASCII space
-    // - the size of the contents in bytes
-    // - a null byte (b"\x00" or '\0')
-    // - the contents
     pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let Some((obj_type, size, rest)) = parse_fields(bytes).context("parse fields")? else {
+        // A git object is stored as follows:
+        // - the object type (blob, commit, tag or tree)
+        // - an ASCII space
+        // - the size of the contents in bytes
+        // - a null byte (b"\x00" or '\0')
+        // - the contents
+        let Some((obj_type, _size, rest)) = parse_fields(bytes).context("parse fields")? else {
             return Err(anyhow!("No bytes to parse"));
         };
 
-        let obj_type = match obj_type {
-            "blob" => GitObjectType::Blob,
-            "commit" => GitObjectType::Commit,
-            "tag" => GitObjectType::Tag,
-            "tree" => GitObjectType::Tree,
-            s => {
-                return Err(anyhow!(
-                    "object type should be either blob, commit, tag or tree, got: {}",
-                    s
-                ))
-            }
-        };
-
-        let size: usize = size.parse().context("parse size")?;
-
-        let contents = match obj_type {
-            GitObjectType::Tree => {
-                let mut entries = String::new();
+        match obj_type {
+            "blob" => Ok(Self::Blob(
+                String::from_utf8(rest.to_owned()).context("convert blob bytes to UTF8")?,
+            )),
+            "commit" => Ok(Self::Commit(rest.to_owned())),
+            "tag" => Ok(Self::Tag),
+            "tree" => {
+                let mut entries = Vec::new();
                 let mut bytes = rest;
                 while let Some((entry, rest)) =
-                    parse_tree_entry(bytes).context("parse tree entry")?
+                    TreeEntry::from_bytes(bytes).context("parse tree entry")?
                 {
-                    entries.push_str(&entry.name);
-                    entries.push('\n');
+                    entries.push(entry);
                     bytes = rest;
                 }
-                entries
+                Ok(Self::Tree(entries))
             }
-            _ => str::from_utf8(rest)
-                .context("convert bytes of contents field to UTF8")?
-                .to_string(),
-        };
+            s => Err(anyhow!(
+                "object type should be either blob, commit, tag or tree, got: {}",
+                s
+            )),
+        }
+    }
 
-        Ok(Self {
-            obj_type,
-            size,
-            contents,
-        })
+    pub(crate) fn to_bytes(&self) -> Vec<u8> {
+        let obj_type = self.kind();
+
+        let contents = self.content_bytes();
+
+        let mut bytes = format!("{} {}\x00", obj_type, contents.len())
+            .as_bytes()
+            .to_owned();
+        bytes.extend(contents);
+
+        bytes
+    }
+
+    pub(crate) fn kind(&self) -> &str {
+        match self {
+            Object::Blob(_) => "blob",
+            Object::Tree(_) => "tree",
+            Object::Commit(_) => "commit",
+            Object::Tag => "tag",
+        }
+    }
+
+    pub(crate) fn content_bytes(&self) -> Vec<u8> {
+        match self {
+            Object::Blob(blob) => blob.as_bytes().to_owned(),
+            Object::Tree(entries) => entries
+                .iter()
+                .flat_map(|entry| entry.to_bytes().into_iter())
+                .collect(),
+            Object::Commit(commit) => commit.clone(),
+            Object::Tag => unimplemented!(),
+        }
+    }
+
+    pub(crate) fn hash(&self) -> [u8; 20] {
+        let bytes = self.to_bytes();
+        let mut hasher = Sha1::new();
+        hasher.update(bytes);
+        hasher.finalize().into()
+    }
+
+    pub(crate) fn write(self, root: &Path) -> Result<()> {
+        let hash = hex::encode(self.hash());
+
+        let (dir_name, file_name) = hash.split_at(2);
+        // Create dir if necessary
+        let dir_path = root.join(".git").join("objects").join(dir_name);
+        if !dir_path.exists() {
+            fs::create_dir_all(&dir_path).context("Create directory in .git/objects")?;
+        }
+        let file_path = dir_path.join(file_name);
+        // Create file
+        let mut file = File::create(file_path)?;
+
+        // Create encoder and compress object
+        let mut e = ZlibEncoder::new(Vec::new(), Compression::default());
+        e.write_all(&self.to_bytes())?;
+        let compressed = e.finish()?;
+
+        file.write_all(&compressed)?;
+
+        Ok(())
     }
 }
 
-// A tree entry is made up of:
-// - a mode
-// - an ASCII space
-// - the file/folder name
-// - a null byte (b"\x00" or '\0')
-// - the sha1 hash
-fn parse_tree_entry(bytes: &[u8]) -> Result<Option<(TreeEntry, &[u8])>> {
-    let Some((mode, name, rest)) = parse_fields(bytes).context("parse fields")? else {
-        return Ok(None);
-    };
+#[derive(Debug)]
+pub(crate) struct TreeEntry {
+    pub mode: usize,
+    pub name: String,
+    pub sha1: Vec<u8>,
+}
 
-    let mode: usize = mode.parse().context("parse mode")?;
+impl TreeEntry {
+    // A tree entry is made up of:
+    // - a mode
+    // - an ASCII space
+    // - the file/folder name
+    // - a null byte (b"\x00" or '\0')
+    // - the sha1 hash
+    fn from_bytes(bytes: &[u8]) -> Result<Option<(TreeEntry, &[u8])>> {
+        let Some((mode, name, rest)) = parse_fields(bytes).context("parse fields")? else {
+            return Ok(None);
+        };
 
-    let name = name.to_string();
+        let mode = mode.parse::<usize>().context("parse mode")?;
 
-    let sha1 = hex::encode(&rest[..20]);
+        let name = name.to_string();
 
-    Ok(Some((TreeEntry { mode, name, sha1 }, &rest[20..])))
+        let sha1 = hex::encode(&rest[..20]).as_bytes().to_owned();
+
+        Ok(Some((Self { mode, name, sha1 }, &rest[20..])))
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = format!("{} {}\x00", self.mode, self.name)
+            .as_bytes()
+            .to_owned();
+        bytes.extend(&self.sha1);
+        bytes
+    }
 }
 
 // There is a recurring logic of fields to parse:
@@ -123,19 +183,4 @@ fn parse_fields(bytes: &[u8]) -> Result<Option<(&str, &str, &[u8])>> {
     bytes = &bytes[null_byte_idx + 1..];
 
     Ok(Some((field1, field2, bytes)))
-}
-
-impl Display for GitObjectType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            match self {
-                Self::Blob => "blob",
-                Self::Commit => "commit",
-                Self::Tag => "tag",
-                Self::Tree => "tree",
-            }
-        )
-    }
 }
