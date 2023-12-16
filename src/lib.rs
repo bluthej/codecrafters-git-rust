@@ -1,5 +1,6 @@
 #[allow(unused)]
 use anyhow::{anyhow, Context, Result};
+use chrono::Local;
 use flate2::bufread::ZlibDecoder;
 use std::fs::{self, File};
 use std::io::{prelude::*, BufReader};
@@ -100,6 +101,60 @@ pub fn git_write_tree() -> Result<()> {
 fn _git_write_tree<W: Write>(root: &Path, writer: &mut W) -> Result<()> {
     let tree = Tree::from_working_directory(root)?;
     let hash = tree.write(root)?;
+
+    writer.write_all(hex::encode(hash).as_bytes())?;
+
+    Ok(())
+}
+
+pub fn git_commit_tree(tree_sha: &str, parent_commit: &str, msg: &str) -> Result<()> {
+    _git_commit_tree(
+        tree_sha,
+        parent_commit,
+        msg,
+        Path::new("."),
+        &mut std::io::stdout(),
+    )
+}
+
+fn _git_commit_tree<W: Write>(
+    tree_sha: &str,
+    parent_commit: &str,
+    msg: &str,
+    root: &Path,
+    writer: &mut W,
+) -> Result<()> {
+    let author = "bluthej <joffrey.bluthe@e.email>";
+    let committer = author;
+
+    let local = Local::now();
+    let timestamp = local.timestamp();
+
+    let offset = local.offset().local_minus_utc();
+    let (sign, offset) = if offset < 0 {
+        ('-', -offset)
+    } else {
+        ('+', offset)
+    };
+    let sec = offset.rem_euclid(60);
+    let mins = offset.div_euclid(60);
+    let min = mins.rem_euclid(60);
+    let hour = mins.div_euclid(60);
+    let time = if sec == 0 {
+        format!("{} {}{:02}{:02}", timestamp, sign, hour, min)
+    } else {
+        format!("{} {}{:02}{:02}:{:02}", timestamp, sign, hour, min, sec)
+    };
+
+    let body = format!(
+        "tree {}\nparent {}\nauthor {} {}\ncommitter {} {}\n\n{}\n",
+        tree_sha, parent_commit, author, time, committer, time, msg
+    );
+
+    let commit = Object::Commit(body.as_bytes().to_owned());
+
+    let hash = commit.hash();
+    commit.write(root)?;
 
     writer.write_all(hex::encode(hash).as_bytes())?;
 
@@ -324,21 +379,45 @@ mod tests {
         _git_write_tree(root, &mut buff).context("call write-tree command")?;
 
         buff.set_position(0);
-        for line in buff.clone().lines() {
-            dbg!(&line?);
-        }
         let mut lines = buff.lines();
         let hash = REPO_WITH_UNCOMMITED_FILES_HASH;
         assert!(lines
             .next()
             .is_some_and(|line| line.is_ok_and(|line| line.trim() == hash)));
         let objects = root.join(".git").join("objects");
-        for entry in fs::read_dir(&objects)? {
-            eprintln!("{entry:?}");
-        }
 
         assert!(objects.join(&hash[..2]).is_dir());
         assert!(objects.join(&hash[..2]).join(&hash[2..]).exists());
+
+        Ok(())
+    }
+
+    #[test]
+    fn commit_tree() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        create_git_repo_with_files(root).context("create git repo with files")?;
+
+        let tree_sha = get_sha("HEAD:./", root)?;
+        let commit_sha = get_sha("HEAD", root)?;
+
+        let mut buff = Cursor::new(Vec::new());
+        let msg = "A new commit";
+        _git_commit_tree(&tree_sha, &commit_sha, msg, root, &mut buff)
+            .context("call commit-tree command with hash of root")?;
+
+        buff.set_position(0);
+        let mut hash = String::new();
+        let bytes = buff.read_line(&mut hash)?;
+        assert_eq!(bytes, 40);
+        assert!(root
+            .join(".git")
+            .join("objects")
+            .join(&hash[..2])
+            .join(&hash[2..])
+            .exists());
+
+        dir.close()?;
 
         Ok(())
     }
